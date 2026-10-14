@@ -6351,24 +6351,33 @@
     button.textContent = "Sending...";
     setStatus("");
 
+    var payload = {
+      access_key: ACCESS_KEY,
+      subject: "Parserje feedback",
+      from_name: "Parserje",
+      message: text
+    };
+    // Only send a reply address when there is a real one. A placeholder address on a
+    // domain nobody owns gets the whole submission rejected.
+    var replyTo = email.value.trim();
+    if (replyTo) payload.email = replyTo;
+
     fetch("https://api.web3forms.com/submit", {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({
-        access_key: ACCESS_KEY,
-        subject: "Parserje feedback",
-        from_name: "Parserje",
-        message: text,
-        email: email.value.trim() || "no-reply@parserje.app"
-      })
+      body: JSON.stringify(payload)
     })
-      .then(function (response) { return response.json(); })
+      .then(function (response) { return response.json().catch(function () { return null; }); })
       .then(function (data) {
-        if (!data || data.success !== true) throw new Error("rejected");
+        if (!data || data.success !== true) {
+          console.error("Feedback not sent. Web3Forms replied:", data);
+          throw new Error("rejected");
+        }
         form.reset();
         setStatus("Thanks — got it.", "ok");
       })
-      .catch(function () {
+      .catch(function (error) {
+        console.error("Feedback submit failed:", error);
         setStatus("That didn't send. Please try again in a moment.", "bad");
       })
       .then(function () {
