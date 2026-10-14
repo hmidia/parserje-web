@@ -1757,13 +1757,24 @@
       else if (descriptionNeedsReview(transaction.Description)) lowConfidence.add("Description");
       if (transaction["Transaction Type"] === "UNCLASSIFIED") lowConfidence.add("Transaction Type");
 
-      const amount = signedAmountCents(transaction.Amount);
+      let amount = signedAmountCents(transaction.Amount);
       const balance = signedAmountCents(transaction.Balance);
       if (amount === null) lowConfidence.add("Amount");
       if (balance === null) lowConfidence.add("Balance");
 
+      // OCR can drop the +/- that gives an amount its direction. When the balance moved by
+      // exactly that amount, the move says which way it went; the row is still flagged.
+      const unsigned = amount !== null && transactionDirection(transaction) === "Unknown";
+      if (unsigned && balance !== null && previousBalance !== null && Math.abs(Math.abs(balance - previousBalance) - amount) <= 2) {
+        transaction.Amount = String(transaction.Amount).trim() + (balance >= previousBalance ? "+" : "-");
+        amount = signedAmountCents(transaction.Amount);
+        lowConfidence.add("Amount");
+      }
+
       if (amount !== null && balance !== null && previousBalance !== null) {
         if (Math.abs(balance - previousBalance - amount) > 2) {
+          // The balance didn't move by this amount: either it was misread or a row above is missing.
+          lowConfidence.add("Amount");
           if (!("_review_status" in transaction)) {
             transaction._review_status = "Reconcile balance gap";
           }
@@ -3008,6 +3019,35 @@
     return out;
   }
 
+  // A row whose balance doesn't follow from the one above usually has a misread amount (a stamp
+  // across the figure, a 1 read as a 4). Take the amount from the balance change only when that
+  // one row then makes the rows add up to the debit and credit totals the statement prints. Any
+  // doubt (no printed totals, or no single row that fits) leaves the rows as read. Stays flagged.
+  function correctAmountFromPrintedTotals(transactions, summary) {
+    if (!summary || summary.debit === null || summary.credit === null) return transactions;
+    const totals = summarize(transactions);
+    if (totals.debit === summary.debit && totals.credit === summary.credit) return transactions;
+    const fits = [];
+    let previousBalance = null;
+    for (const transaction of transactions) {
+      const amount = signedAmountCents(transaction.Amount);
+      const balance = signedAmountCents(transaction.Balance);
+      const signed = transactionDirection(transaction) !== "Unknown";
+      if (signed && amount !== null && balance !== null && previousBalance !== null && Math.abs(balance - previousBalance - amount) > 2) {
+        const change = balance - previousBalance;
+        const debit = totals.debit - Math.max(-amount, 0) + Math.max(-change, 0);
+        const credit = totals.credit - Math.max(amount, 0) + Math.max(change, 0);
+        if (debit === summary.debit && credit === summary.credit) fits.push([transaction, change]);
+      }
+      if (balance !== null) previousBalance = balance;
+    }
+    if (fits.length !== 1) return transactions;
+    const [transaction, change] = fits[0];
+    transaction.Amount = formatCents(Math.abs(change)) + (change >= 0 ? "+" : "-");
+    if (transaction._review_status === "Reconcile balance gap") delete transaction._review_status;
+    transaction._low_confidence_fields = sortedUnique(new Set([...(transaction._low_confidence_fields || []), "Amount"]));
+    return transactions;
+  }
   // verdict: "verified" (matches the statement), "mismatch" (doesn't), "unchecked" (nothing to check against)
   function reconcile(outcome) {
     const rows = outcome.transactions || [];
@@ -3498,7 +3538,7 @@
     return {
       bank,
       method: "ocr",
-      transactions: applyStatementYear(parseTransactions(cleanLines(ocrLines)), statementDate),
+      transactions: applyStatementYear(correctAmountFromPrintedTotals(parseTransactions(cleanLines(ocrLines)), ocrSummary), statementDate),
     };
   }
 
