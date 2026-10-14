@@ -1260,6 +1260,7 @@
         <svg aria-hidden="true" width="18" height="18" viewBox="0 0 20 20" fill="none"><path d="M10 3.2 18 17H2L10 3.2Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M10 8.2v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="10" cy="14.6" r="0.9" fill="currentColor"/></svg>
         <p id="result-alert-text"></p>
       </div>
+      <p class="results-desc" id="duplicates-note" hidden></p>
       <div class="totals" id="totals"></div>
     </div>
     <div class="rgroup results-data">
@@ -4032,9 +4033,15 @@
     return String(value);
   }
 
-  function writeSheet(sheet, transactions, direction) {
+  // note: one line in the free row above the table (e.g. pointing to Duplicates Removed).
+  function writeSheet(sheet, transactions, direction, note) {
     const header = TABLE_HEADER_ROW;
     writeSummary(sheet, transactions, direction);
+    if (note) {
+      const noteCell = sheet.getCell(header - 1, 1);
+      noteCell.value = note;
+      noteCell.font = { italic: true };
+    }
     HEADERS.forEach((title, index) => { sheet.getCell(header, index + 1).value = title; });
 
     transactions.forEach((transaction, offset) => {
@@ -4080,6 +4087,7 @@
     for (let column = 1; column <= HEADERS.length; column += 1) {
       let widest = 0;
       for (let row = 1; row <= lastRow; row += 1) {
+        if (note && row === header - 1) continue;   // the note runs across columns; it doesn't size one
         widest = Math.max(widest, cellWidthText(sheet.getCell(row, column).value).length);
       }
       sheet.getColumn(column).width = Math.min(Math.max(widest + 2, 12), 60);
@@ -4148,13 +4156,61 @@
     return plan;
   }
 
+  const DUPLICATE_HEADERS = ["Date", "Description", "Type", "Amount", "Balance", "From file", "Duplicate of"];
+
+  // The evidence beside the ledger: each removed row as it was read, where it came from, and
+  // which file holds the copy that was kept, so the removal can be checked.
+  function writeDuplicatesSheet(sheet, removed) {
+    const intro = sheet.getCell(1, 1);
+    intro.value = "Rows that appear in two overlapping statements. Each one is left out of the other sheets; the copy in the file under Duplicate of is kept.";
+    intro.font = { italic: true };
+    const header = 3;
+    DUPLICATE_HEADERS.forEach((title, index) => {
+      const cell = sheet.getCell(header, index + 1);
+      cell.value = title;
+      cell.font = { bold: true };
+    });
+    removed.forEach(({ transaction, from, duplicateOf }, offset) => {
+      const row = header + 1 + offset;
+      const dateCell = sheet.getCell(row, 1);
+      dateCell.value = excelDateValue(transaction);
+      if (dateCell.value instanceof Date) dateCell.numFmt = DATE_NUMBER_FORMAT;
+      sheet.getCell(row, 2).value = transaction.Description;
+      sheet.getCell(row, 3).value = transaction["Transaction Type"];
+      const amountCell = sheet.getCell(row, 4);
+      amountCell.value = signedCents(transaction) / 100;
+      amountCell.numFmt = AMOUNT_NUMBER_FORMAT;
+      const balanceCell = sheet.getCell(row, 5);
+      balanceCell.value = balanceCents(transaction) / 100;
+      balanceCell.numFmt = AMOUNT_NUMBER_FORMAT;
+      sheet.getCell(row, 6).value = from;
+      sheet.getCell(row, 7).value = duplicateOf;
+    });
+    sheet.views = [{ state: "frozen", xSplit: 0, ySplit: header }];
+    sheet.autoFilter = `A${header}:G${header + removed.length}`;
+    const lastRow = header + removed.length;
+    for (let column = 1; column <= DUPLICATE_HEADERS.length; column += 1) {
+      let widest = 0;
+      for (let row = header; row <= lastRow; row += 1) {
+        widest = Math.max(widest, cellWidthText(sheet.getCell(row, column).value).length);
+      }
+      sheet.getColumn(column).width = Math.min(Math.max(widest + 2, 12), 60);
+    }
+  }
+
+  // options.duplicates: removeOverlaps().removed. Its sheet exists only when something was removed.
   async function buildWorkbook(ExcelJS, transactions, options) {
     const workbook = new ExcelJS.Workbook();
     workbook.creator = "Parserje";
+    const duplicates = options.duplicates || [];
+    const pointer = duplicates.length
+      ? `${duplicates.length} ${duplicates.length === 1 ? "row was" : "rows were"} removed as duplicates of overlapping statements. See Duplicates Removed.`
+      : "";
     if (options.summary) writeSummarySheet(workbook.addWorksheet("Summary"), options.summary);
     for (const [title, sheetTransactions, direction] of sheetPlan(transactions, options.includeMonthly)) {
-      writeSheet(workbook.addWorksheet(title), sheetTransactions, direction);
+      writeSheet(workbook.addWorksheet(title), sheetTransactions, direction, title === "All" ? pointer : "");
     }
+    if (duplicates.length) writeDuplicatesSheet(workbook.addWorksheet("Duplicates Removed"), duplicates);
     return workbook.xlsx.writeBuffer();
   }
 
@@ -4235,6 +4291,56 @@
       check.verdict = "verified";
     }
     return check;
+  }
+
+  // ------------------------------------------------------------------
+  // Overlapping statements of one account (Jan–Mar and Feb–Apr both carry February)
+  // ------------------------------------------------------------------
+
+  function transactionText(transaction) {
+    const description = Array.isArray(transaction.Description) ? transaction.Description.join(" ") : String(transaction.Description || "");
+    return collapse(description).toUpperCase();
+  }
+
+  // statements: [{ name, transactions }] in upload order. Only rows from different files are
+  // compared: two identical rows inside one statement are two real transactions. Date + signed
+  // amount + balance identify a row, and the running balance is what tells two genuine RM50
+  // transfers on one day apart. The first copy is kept. Without a balance nothing proves a
+  // repeat, so a pair matching on date, amount and description is flagged and both are kept.
+  // Never changes the rows it's given (they're cached per file); flagged rows are copies.
+  // Returns { transactions, removed: [{ transaction, from, duplicateOf }], flagged }.
+  function removeOverlaps(statements) {
+    const seen = new Map();   // key -> [{ name, index (in kept), matched }]
+    const kept = [];
+    const removed = [];
+    let flagged = 0;
+    const flag = (transaction) => ({ ...transaction, _review_status: transaction._review_status || "Check possible duplicate" });
+    for (const { name, transactions } of statements) {
+      for (const transaction of transactions) {
+        const date = transaction._transaction_date ? dateKey(transaction._transaction_date) : String(transaction.Date || "").trim();
+        const amount = signedCents(transaction);
+        const balance = balanceCents(transaction);
+        if (!date || amount === null) {
+          kept.push(transaction);
+          continue;
+        }
+        const key = balance === null ? `${date}|${amount}|${transactionText(transaction)}` : `${date}|${amount}|${balance}`;
+        const earlier = (seen.get(key) || []).find((entry) => entry.name !== name && !entry.matched);
+        if (earlier) earlier.matched = true;
+        if (earlier && balance !== null) {
+          removed.push({ transaction, from: name, duplicateOf: earlier.name });
+          continue;
+        }
+        if (earlier) {
+          kept[earlier.index] = flag(kept[earlier.index]);
+          flagged += 2;
+        }
+        if (!seen.has(key)) seen.set(key, []);
+        seen.get(key).push({ name, index: kept.length, matched: Boolean(earlier) });
+        kept.push(earlier ? flag(transaction) : transaction);
+      }
+    }
+    return { transactions: kept, removed, flagged };
   }
 
   function checkShortReason(check) {
@@ -4491,7 +4597,7 @@
     parseBankIslamTransactions, parseMaybankScannedStatement, detectBank,
     statementDateFromHeader, applyStatementYear, sortTransactions, transactionsByMonth, MONTH_NAMES,
     parseBankIslamTable, statementSummary, reconcile, isLegacyBankIslamLayout,
-    accountNumbersFromLines, sameAccountNumber,
+    accountNumbersFromLines, sameAccountNumber, removeOverlaps,
     // pdf.js adapters
     textLinesFromItems, wordsFromItems, ocrResultToPage, preprocessForOcr,
     // export
@@ -5599,7 +5705,8 @@
     if (!proceed) { backToSelected(); el.extract.focus(); return; }
 
     for (const outcome of parsed) for (const t of outcome.transactions) t._source = outcome.name;
-    const all = Core.sortTransactions(parsed.flatMap((outcome) => outcome.transactions));
+    const merged = Core.removeOverlaps(parsed.map((outcome) => ({ name: outcome.name, transactions: outcome.transactions })));
+    const all = Core.sortTransactions(merged.transactions);
     if (!all.length) {
       backToSelected();
       showDialog(
@@ -5629,6 +5736,8 @@
       example: false,
       unread,
       leftOut,
+      duplicates: merged.removed,
+      possibleDuplicates: merged.flagged,
       summary: null,
       statements: parsed.map((outcome) => ({ ...Core.statementTotals(outcome), check: checks.get(outcome) })),
       sources: parsed.map((outcome) => ({
@@ -5754,6 +5863,27 @@
     $("result-alert-text").textContent = lines.join(" ");
   }
 
+  // Overlap between statements is reported, never silent: how many rows went, and from where.
+  function renderDuplicatesNote(result) {
+    const note = $("duplicates-note");
+    const removed = result.duplicates || [];
+    const possible = result.possibleDuplicates || 0;
+    note.hidden = !removed.length && !possible;
+    if (note.hidden) return;
+    const pairs = [...new Set(removed.map((item) => `${item.duplicateOf} and ${item.from}`))];
+    const parts = [];
+    if (removed.length) {
+      parts.push(pairs.length === 1
+        ? `Removed ${plural(removed.length, "duplicate row")}: ${pairs[0]} overlap.`
+        : `Removed ${plural(removed.length, "duplicate row")} where statements overlap: ${pairs.join(", ")}.`);
+      parts.push("The Excel file lists them on a Duplicates Removed sheet.");
+    }
+    if (possible) {
+      parts.push(`${plural(possible, "row")} with no balance to compare may be duplicates, so both copies are kept and marked for checking.`);
+    }
+    note.textContent = parts.join(" ");
+  }
+
   function renderResults() {
     const { result } = state;
     el.viewResults.classList.toggle("is-empty", !result);
@@ -5777,6 +5907,7 @@
     $("keep-note").hidden = result.example;
     $("clear-workbook").hidden = result.example;
     renderAlert(result);
+    renderDuplicatesNote(result);
     $("sources-row").hidden = !result.sources.length;
     el.sources.replaceChildren(...result.sources.map((source) => {
       const chip = document.createElement("li");
@@ -6258,6 +6389,7 @@
       const buffer = await Core.buildWorkbook(window.ExcelJS, result.transactions, {
         includeMonthly: result.monthly,
         summary: result.summary ? summaryFor(result) : null,
+        duplicates: result.duplicates,
       });
       const filename = `${Core.filenamePrefix(result.company)}.xlsx`;
       const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
