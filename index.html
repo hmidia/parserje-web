@@ -884,7 +884,11 @@
   }
   .pick:hover { border-color: var(--border-strong); }
   .pick:has(input:checked) { border-color: var(--primary); background: var(--surface-selected); }
-  .pick input[type="checkbox"] { margin: 3px 0 0; width: 16px; height: 16px; accent-color: var(--primary); flex: none; }
+  .pick input[type="checkbox"], .pick input[type="radio"] { margin: 3px 0 0; width: 16px; height: 16px; accent-color: var(--primary); flex: none; }
+  .account-options { display: flex; flex-direction: column; gap: 8px; max-height: min(320px, 50vh); overflow-y: auto; }
+  .account-options .pick-text small { overflow-wrap: anywhere; }
+  .account-options .pick-count { flex: none; font-size: 12px; color: var(--text-hint); }
+  .account-note { color: var(--text-hint); }
   .pick-text { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
   .pick-text b { font-size: 14px; font-weight: 600; color: var(--text); }
   .pick-text small { font-size: 12px; color: var(--text-hint); line-height: 1.45; }
@@ -1344,6 +1348,18 @@
     </div>
     <p id="confirm-message"></p>
     <div class="row"><button class="btn-secondary" id="confirm-secondary" type="button"></button><button class="btn-primary" id="confirm-primary" type="button"></button></div>
+  </div>
+</div>
+<div class="scrim confirm" id="account-choice" hidden>
+  <div class="dialog summary-dialog" role="dialog" aria-modal="true" aria-labelledby="account-choice-title" aria-describedby="account-choice-intro">
+    <div class="dialog-head">
+      <h3 id="account-choice-title">Which Account?</h3>
+      <button class="dialog-close" id="account-choice-close" type="button" aria-label="Close"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+    </div>
+    <p class="intro" id="account-choice-intro">These statements cover more than one account. Parserje builds one workbook per account.</p>
+    <div class="account-options" id="account-options" role="radiogroup" aria-labelledby="account-choice-title"></div>
+    <p class="account-note">The others will be left out of this workbook.</p>
+    <div class="row"><button class="btn-secondary" id="account-start-over" type="button">Start Over</button><button class="btn-primary" id="account-continue" type="button" disabled>Continue</button></div>
   </div>
 </div>
 <div class="scrim" id="dialog" hidden>
@@ -3392,10 +3408,16 @@
     return normaliseAccountNumber(value);
   }
 
-  // Masked numbers ("****9012") match on the trailing digits both sides show.
-  function sameAccountNumber(a, b) {
+  // Masked numbers ("****9012") match on the trailing digits both sides show. A number read by OCR
+  // (fromOcr) may have one misread digit: it matches when the last four agree exactly and at most
+  // one digit before them differs. Numbers from a text layer must match exactly.
+  function sameAccountNumber(a, b, fromOcr) {
     if (!a || !b) return false;
-    if (!a.includes("*") && !b.includes("*")) return a === b;
+    if (!a.includes("*") && !b.includes("*")) {
+      if (a === b) return true;
+      if (!fromOcr || a.length !== b.length || a.slice(-4) !== b.slice(-4)) return false;
+      return Array.from(a).filter((digit, index) => digit !== b[index]).length <= 1;
+    }
     const visible = (value) => value.slice(value.lastIndexOf("*") + 1);
     const tailA = visible(a);
     const tailB = visible(b);
@@ -3456,7 +3478,7 @@
         ? (await doc.ocrPage(pageIndex)).text.split(/\r?\n/)
         : await doc.pageTextLines(pageIndex);
       for (const number of accountNumbersFromLines(lines)) {
-        if (!numbers.some((known) => sameAccountNumber(known, number))) numbers.push(number);
+        if (!numbers.some((known) => sameAccountNumber(known, number, method === "ocr"))) numbers.push(number);
       }
     }
     return numbers;
@@ -4612,17 +4634,22 @@
 
   // What the user should know before trusting a result: flagged rows and unrecognised banks.
   function resultIssues(result) {
-    if (!result || result.example) return { any: false, flagged: 0, unknown: [], failed: [], unread: [], summary: "" };
+    if (!result || result.example) return { any: false, flagged: 0, unknown: [], failed: [], unread: [], leftOut: [], summary: "" };
     const flagged = result.transactions.filter(needsChecking).length;
     const unknown = result.sources.filter((source) => source.bank === Core.BANKS.UNKNOWN).map((source) => source.name);
     const failed = result.sources.filter((source) => source.check && source.check.verdict === "mismatch");
     const unread = result.unread || [];
+    const leftOut = result.leftOut || [];
     const parts = [];
     if (unread.length) parts.push(`${plural(unread.length, "file")} couldn't be read`);
+    if (leftOut.length) parts.push(leftOut.length === 1 ? `1 file left out: ${leftOut[0].name}` : `${leftOut.length} files left out`);
     if (failed.length) parts.push(`${plural(failed.length, "file")} not reliable`);
     if (flagged) parts.push(`${flagged} of ${result.transactions.length} rows need checking`);
     if (unknown.length) parts.push("bank not recognised");
-    return { any: Boolean(flagged || unknown.length || failed.length || unread.length), flagged, unknown, failed, unread, summary: parts.join(" · ") };
+    return {
+      any: Boolean(flagged || unknown.length || failed.length || unread.length || leftOut.length),
+      flagged, unknown, failed, unread, leftOut, summary: parts.join(" · "),
+    };
   }
 
   // Two-choice dialog. Resolves "primary", "secondary" or "cancel" (Esc / backdrop).
@@ -4656,6 +4683,68 @@
     });
   }
 
+  function maskedAccount(account) {
+    return account ? `••••${account.slice(-4)}` : "Account not read";
+  }
+
+  // Which Account?: one choice per account found. Resolves the chosen group's index,
+  // "secondary" (Start Over) or "cancel" (Esc / backdrop). The largest group is preselected
+  // only when there is one; on an even split Continue waits for a pick.
+  function chooseAccount(groups) {
+    const box = $("account-choice");
+    const list = $("account-options");
+    const proceed = $("account-continue");
+    const sizes = groups.map((group) => group.outcomes.length);
+    const largest = Math.max(...sizes);
+    const preselect = sizes.filter((size) => size === largest).length === 1 ? sizes.indexOf(largest) : -1;
+    list.replaceChildren(...groups.map((group, index) => {
+      const option = document.createElement("label");
+      option.className = "pick";
+      const input = document.createElement("input");
+      input.type = "radio";
+      input.name = "account-choice";
+      input.value = String(index);
+      input.checked = index === preselect;
+      input.addEventListener("change", () => { proceed.disabled = false; });
+      const text = document.createElement("span");
+      text.className = "pick-text";
+      const title = document.createElement("b");
+      title.textContent = `${bankLabel(group.bank)} · ${maskedAccount(group.account)}`;
+      const names = document.createElement("small");
+      names.textContent = group.outcomes.map((outcome) => outcome.name).join(", ");
+      text.append(title, names);
+      const count = document.createElement("span");
+      count.className = "pick-count";
+      count.textContent = plural(group.outcomes.length, "file");
+      option.append(input, text, count);
+      return option;
+    }));
+    proceed.disabled = preselect === -1;
+    const opener = document.activeElement;
+    box.hidden = false;
+    (list.querySelector("input:checked") || list.querySelector("input")).focus();
+    return new Promise((resolve) => {
+      const done = (value) => {
+        box.hidden = true;
+        proceed.onclick = $("account-start-over").onclick = $("account-choice-close").onclick = box.onclick = null;
+        document.removeEventListener("keydown", onKey, true);
+        if (opener && document.contains(opener)) opener.focus({ preventScroll: true });
+        resolve(value);
+      };
+      const onKey = (event) => {
+        if (event.key === "Escape") { event.stopPropagation(); done("cancel"); }
+      };
+      proceed.onclick = () => {
+        const picked = list.querySelector("input:checked");
+        if (picked) done(Number(picked.value));
+      };
+      $("account-start-over").onclick = () => done("secondary");
+      $("account-choice-close").onclick = () => done("cancel");
+      box.onclick = (event) => { if (event.target === box) done("cancel"); };
+      document.addEventListener("keydown", onKey, true);
+    });
+  }
+
   let dialogOpener = null;
   function showDialog(title, message, action) {
     el.dialogTitle.textContent = title;
@@ -4680,7 +4769,7 @@
   const FOCUSABLE = 'button:not([disabled]):not([hidden]), input:not([disabled]), select:not([disabled]), [tabindex="0"]:not([aria-disabled="true"])';
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Tab") return;
-    const layer = [$("confirm"), el.dialog, $("summary-panel"), $("upload-modal")].find((node) => node && !node.hidden);
+    const layer = [$("account-choice"), $("confirm"), el.dialog, $("summary-panel"), $("upload-modal")].find((node) => node && !node.hidden);
     if (!layer) return;
     const items = Array.from(layer.querySelectorAll(FOCUSABLE)).filter((node) => node.offsetParent !== null);
     if (!items.length) { event.preventDefault(); return; }
@@ -5312,6 +5401,104 @@
     }
   }
 
+  // Why a file that was read isn't in the workbook, as shown with the results.
+  const LEFT_OUT_REASONS = {
+    account: (names, one) => `${names} ${one ? "is from a different account" : "are from other accounts"}, so ${one ? "it isn't" : "they aren't"} in this workbook. ` +
+      `Extract ${one ? "it" : "each account"} on its own for ${one ? "that account's" : "its"} workbook.`,
+    bank: (names, one) => `${names} ${one ? "is from a different bank" : "are from other banks"}, so ${one ? "it isn't" : "they aren't"} in this workbook. ` +
+      `Extract ${one ? "it" : "each account"} on its own for ${one ? "that account's" : "its"} workbook.`,
+    unreadable: (names, one) => `${names} ${one ? "was" : "were"} left out because Parserje couldn't read ${one ? "its account number" : "their account numbers"}. ` +
+      `If ${one ? "it's" : "they're"} from this account, extract again and choose Include Anyway.`,
+    unrecognised: (names, one) => `${names} ${one ? "isn't" : "aren't"} in this workbook because Parserje didn't recognise ${one ? "its bank" : "their banks"}.`,
+  };
+
+  // Drop parsed statements from this workbook. The files stay in the list marked Left Out,
+  // and the reason (a LEFT_OUT_REASONS key) is shown with the results.
+  function leaveOut(parsed, outcomes, reason, leftOut) {
+    for (const outcome of outcomes) {
+      parsed.splice(parsed.indexOf(outcome), 1);
+      leftOut.push({ name: outcome.name, reason });
+      const entry = state.files.find((item) => item.file.name === outcome.name);
+      if (entry) { entry.status = "Left Out"; entry.kind = ""; }
+    }
+  }
+
+  // One workbook covers one account (bank + account number). Resolves true to build the workbook
+  // from what's left in parsed, or false to go back to the file list.
+  async function checkOneAccount(parsed, leftOut) {
+    // A PDF holding several accounts is never one account, however the rest is grouped.
+    const several = parsed.filter((outcome) => (outcome.accountNumbers || []).length > 1);
+    if (several.length) {
+      const one = several.length === 1;
+      const choice = await confirmChoice(
+        one ? "This Covers More Than One Account" : "These Cover More Than One Account",
+        `${several.map((outcome) => outcome.name).join(", ")} ${one ? "holds" : "hold"} statements for several accounts. ` +
+        `Parserje builds one workbook per account, so it can't read ${one ? "this file as it is" : "these files as they are"}.`,
+        one ? "Remove It" : "Remove Them", "Start Over",
+      );
+      if (choice !== "primary") return false;
+      for (const outcome of several) {
+        parsed.splice(parsed.indexOf(outcome), 1);
+        const index = state.files.findIndex((item) => item.file.name === outcome.name);
+        if (index !== -1) state.files.splice(index, 1);
+      }
+      renderUpload();
+      if (!parsed.length) return false;
+    }
+    if (parsed.length < 2) return true;
+
+    // Group by bank + account. With no account number read anywhere, group by bank alone.
+    const groups = [];
+    for (const outcome of parsed.filter((item) => item.accountNumber)) {
+      const group = groups.find((item) => item.bank === outcome.bank &&
+        Core.sameAccountNumber(item.account, outcome.accountNumber, item.fromOcr || outcome.method === "ocr"));
+      if (group) group.outcomes.push(outcome);
+      else groups.push({ bank: outcome.bank, account: outcome.accountNumber, fromOcr: outcome.method === "ocr", outcomes: [outcome] });
+    }
+    const unreadable = parsed.filter((item) => !item.accountNumber);
+    if (!groups.length) {
+      for (const outcome of unreadable) {
+        const group = groups.find((item) => item.bank === outcome.bank);
+        if (group) group.outcomes.push(outcome);
+        else groups.push({ bank: outcome.bank, account: null, outcomes: [outcome] });
+      }
+    }
+
+    let kept = groups[0];
+    if (groups.length > 1) {
+      const choice = await chooseAccount(groups);
+      if (typeof choice !== "number") return false;
+      kept = groups[choice];
+      leaveOut(parsed, groups.filter((group) => group !== kept).flatMap((group) => group.outcomes),
+        "account", leftOut);
+    }
+
+    // A different bank is a different account even without a number to compare.
+    const otherBank = unreadable.filter((outcome) => parsed.includes(outcome) && outcome.bank !== kept.bank);
+    leaveOut(parsed, otherBank, "bank", leftOut);
+
+    // Unreadable numbers from the same bank: ask rather than guess. Grouped by bank alone, the
+    // kept group is all unreadable files, so the question covers all of them at once.
+    const unsure = unreadable.filter((outcome) => parsed.includes(outcome));
+    if (unsure.length && parsed.length > 1) {
+      const one = unsure.length === 1;
+      const all = unsure.length === parsed.length;
+      const choice = await confirmChoice(
+        "Couldn't Confirm the Account",
+        `Parserje couldn't read the account number on ${unsure.map((outcome) => outcome.name).join(", ")}, so it can't tell ` +
+        (all ? "whether they're from the same account." : `whether ${one ? "it matches" : "they match"} the others.`),
+        one ? "Leave It Out" : "Leave Them Out", "Include Anyway",
+      );
+      if (choice === "cancel") return false;
+      if (choice === "primary") {
+        leaveOut(parsed, unsure, "unreadable", leftOut);
+        if (!parsed.length) return false;
+      }
+    }
+    renderUpload();
+    return true;
+  }
+
   async function extract() {
     if (!state.files.length || state.phase === "extracting") return;
     const current = state.real;
@@ -5339,8 +5526,17 @@
     const total = state.files.length;
     const parsed = [];
     const unread = [];   // {name, reason}: files that couldn't be read; the rest still make a workbook
+    const leftOut = [];  // {name, reason}: read, but not part of this workbook
     for (let index = 0; index < total; index += 1) {
       const entry = state.files[index];
+      // Read once per file: leaving files out and extracting again never re-reads (or re-OCRs) the rest.
+      if (entry.outcome) {
+        parsed.push({ name: entry.file.name, ...entry.outcome });
+        entry.status = `${entry.outcome.transactions.length} rows`;
+        entry.kind = "ok";
+        renderUpload();
+        continue;
+      }
       entry.status = "Reading";
       renderUpload();
       // The filename is already in the list above, so the counter stays short.
@@ -5356,6 +5552,7 @@
         if (cancelled()) return;
         const outcome = await Core.parseStatement(doc, (step) => report(step));
         if (cancelled()) return;
+        entry.outcome = outcome;
         parsed.push({ name: entry.file.name, ...outcome });
         entry.status = `${outcome.transactions.length} rows`;
         entry.kind = "ok";
@@ -5392,14 +5589,14 @@
       if (cancelled()) return;
       if (choice === "cancel") { backToSelected(); return; }
       if (choice === "primary") {
-        for (const outcome of strangers) {
-          parsed.splice(parsed.indexOf(outcome), 1);
-          const entry = state.files.find((item) => item.file.name === outcome.name);
-          if (entry) { entry.status = "Left Out"; entry.kind = ""; }
-        }
+        leaveOut(parsed, strangers, "unrecognised", leftOut);
         renderUpload();
       }
     }
+
+    const proceed = await checkOneAccount(parsed, leftOut);
+    if (cancelled()) return;
+    if (!proceed) { backToSelected(); el.extract.focus(); return; }
 
     for (const outcome of parsed) for (const t of outcome.transactions) t._source = outcome.name;
     const all = Core.sortTransactions(parsed.flatMap((outcome) => outcome.transactions));
@@ -5431,6 +5628,7 @@
       monthly: Boolean(previous.monthly),
       example: false,
       unread,
+      leftOut,
       summary: null,
       statements: parsed.map((outcome) => ({ ...Core.statementTotals(outcome), check: checks.get(outcome) })),
       sources: parsed.map((outcome) => ({
@@ -5537,11 +5735,15 @@
     const issues = resultIssues(result);
     const failedNames = new Set(issues.failed.map((source) => source.name));
     const unknownOnly = issues.unknown.filter((name) => !failedNames.has(name));
-    box.hidden = !issues.failed.length && !unknownOnly.length && !issues.unread.length;
+    box.hidden = !issues.failed.length && !unknownOnly.length && !issues.unread.length && !issues.leftOut.length;
     box.classList.toggle("bad", issues.failed.length > 0 || issues.unread.length > 0);
     if (box.hidden) return;
     const lines = issues.unread.map((item) =>
       `${item.name} couldn't be read, so it isn't in this workbook. ${item.reason}`);
+    for (const [reason, sentence] of Object.entries(LEFT_OUT_REASONS)) {
+      const names = issues.leftOut.filter((item) => item.reason === reason).map((item) => item.name);
+      if (names.length) lines.push(sentence(names.join(", "), names.length === 1));
+    }
     lines.push(...issues.failed.map((source) =>
       `${source.name} couldn't be read reliably. ${failureReason(source)}`));
     if (issues.failed.length) lines.push("Check every row against the statement before using this workbook.");
