@@ -1,0 +1,13 @@
+{
+  "name": "parserje-tests",
+  "private": true,
+  "type": "module",
+  "description": "Parser regression suite for Parserje",
+  "scripts": {
+    "test": "node run.mjs",
+    "record": "node run.mjs --update"
+  },
+  "dependencies": {
+    "pdfjs-dist": "3.11.174"
+  }
+}

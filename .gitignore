@@ -1,0 +1,12 @@
+.DS_Store
+Thumbs.db
+*.log
+
+# Test data stays local: fixtures are real bank statements and the expected
+# files hold every transaction in them. This repo is public.
+tests/fixtures/*
+!tests/fixtures/.gitkeep
+tests/expected/*
+!tests/expected/.gitkeep
+tests/node_modules/
+tests/package-lock.json
