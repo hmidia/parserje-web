@@ -3323,7 +3323,115 @@
 
   class ProcessingError extends Error {}
 
+  // ------------------------------------------------------------------
+  // Account number (statement header)
+  // ------------------------------------------------------------------
+
+  // English and Malay labels. A bare "A/C" only counts at the start of a line: Maybank's
+  // transaction types ("TRANSFER FR A/C") carry it mid-line.
+  const ACCOUNT_LABEL_RE = /\b(?:ACCOUNT\s+(?:NO\b\.?|NUMBER)|A\/C\s+NO\b\.?|NOMBOR\s+AKAUN|NO\b\.?\s*AKAUN|AKAUN\s+NO\b\.?)|^\s*A\/C(?![A-Z])/gi;
+  const ACCOUNT_TRANSFER_PREFIX_RE = /\b(?:FR|FROM|TO|INTO|KE|DARI)\s*$/i;
+  // Digit or mask groups joined by single spaces, dashes or dots: "1234 5678 9012", "XXXX-XXXX-9012".
+  const ACCOUNT_VALUE_RE = /^[\s:.\-–]*([0-9X*•](?:[ .\-]?[0-9X*•])*)(\/?)/i;
+
+  // Digits only, with any mask character as "*". Null unless it looks like an account number.
+  function normaliseAccountNumber(raw) {
+    const value = String(raw).toUpperCase().replace(/[\s.\-–]/g, "").replace(/[X•]/g, "*");
+    if (!/^[\d*]+$/.test(value) || value.length > 16) return null;
+    const masked = value.includes("*");
+    const digits = value.replace(/\*/g, "").length;
+    return digits >= 4 && (masked || digits >= 8) ? value : null;
+  }
+
+  function accountNumberFromText(text) {
+    const match = ACCOUNT_VALUE_RE.exec(text);
+    if (!match) return null;
+    let value = match[1];
+    // "1234 5678 9012 31/03/26": the date that follows isn't part of the number.
+    if (match[2]) value = value.replace(/[ .\-]?[0-9X*•]+$/i, "");
+    return normaliseAccountNumber(value);
+  }
+
+  // Masked numbers ("****9012") match on the trailing digits both sides show.
+  function sameAccountNumber(a, b) {
+    if (!a || !b) return false;
+    if (!a.includes("*") && !b.includes("*")) return a === b;
+    const visible = (value) => value.slice(value.lastIndexOf("*") + 1);
+    const tailA = visible(a);
+    const tailB = visible(b);
+    const shared = Math.min(tailA.length, tailB.length);
+    return shared > 0 && tailA.slice(-shared) === tailB.slice(-shared);
+  }
+
+  // Where an account number can be printed: the header above the table, and the few lines
+  // under each table title. CIMB puts "Account No / No Akaun" beneath "Savings Account
+  // Transaction Details", once per account section, and doesn't repeat it on later pages.
+  function accountHeaderBlocks(lines) {
+    const prepared = lines.map((line) => String(line).trim()).filter(Boolean);
+    const blocks = [statementHeaderLines(prepared)];
+    prepared.forEach((line, index) => {
+      const normalized = normalizeOcrText(line);
+      const opensTable = TABLE_MARKERS.some((marker) => normalized.includes(marker)) || normalized.includes("ACCOUNT TRANSACTION DETAILS");
+      if (opensTable) blocks.push(prepared.slice(index + 1, index + 4));
+    });
+    return blocks;
+  }
+
+  // A label that ends its line has the number beneath it: at the start of a line, or, on a
+  // two-column header read across (Maybank scans), as the last word after the address.
+  function accountNumberBelowLabel(block, index) {
+    for (const line of block.slice(index + 1, index + 4)) {
+      const trailing = /(?:^|\s)([0-9X*•][0-9X*•.\-]{6,}[0-9X*•])\s*$/i.exec(line);
+      const number = accountNumberFromText(line) || (trailing && normaliseAccountNumber(trailing[1]));
+      if (number) return number;
+    }
+    return null;
+  }
+
+  // Every labelled account number in one page's header, in order.
+  function accountNumbersFromLines(lines) {
+    const found = [];
+    for (const block of accountHeaderBlocks(lines)) {
+      block.forEach((line, index) => {
+        for (const match of line.matchAll(ACCOUNT_LABEL_RE)) {
+          if (ACCOUNT_TRANSFER_PREFIX_RE.test(line.slice(0, match.index))) continue;
+          const rest = line.slice(match.index + match[0].length);
+          const number = /^[\s:.\-–]*$/.test(rest) ? accountNumberBelowLabel(block, index) : accountNumberFromText(rest);
+          if (number) {
+            found.push(number);
+            break;
+          }
+        }
+      });
+    }
+    return found;
+  }
+
+  // Distinct account numbers across every page header, first match first. More than one
+  // means the PDF covers several accounts. OCR pages are already cached by the time this runs.
+  async function statementAccountNumbers(doc, method) {
+    const numbers = [];
+    for (let pageIndex = 0; pageIndex < doc.pageCount; pageIndex += 1) {
+      const lines = method === "ocr"
+        ? (await doc.ocrPage(pageIndex)).text.split(/\r?\n/)
+        : await doc.pageTextLines(pageIndex);
+      for (const number of accountNumbersFromLines(lines)) {
+        if (!numbers.some((known) => sameAccountNumber(known, number))) numbers.push(number);
+      }
+    }
+    return numbers;
+  }
+
   async function parseStatement(doc, onStep) {
+    const outcome = await parseStatementRows(doc, onStep);
+    // The rows are already read. A header that trips up the account lookup leaves the
+    // account unknown; it never costs the person their extraction.
+    let accountNumbers = [];
+    try { accountNumbers = await statementAccountNumbers(doc, outcome.method); } catch (error) { accountNumbers = []; }
+    return { ...outcome, accountNumber: accountNumbers[0] || null, accountNumbers };
+  }
+
+  async function parseStatementRows(doc, onStep) {
     const step = onStep || (() => {});
     const selectable = await doc.selectableLines();
     let bank = detectBank(selectable);
@@ -4321,6 +4429,7 @@
     parseBankIslamTransactions, parseMaybankScannedStatement, detectBank,
     statementDateFromHeader, applyStatementYear, sortTransactions, transactionsByMonth, MONTH_NAMES,
     parseBankIslamTable, statementSummary, reconcile, isLegacyBankIslamLayout,
+    accountNumbersFromLines, sameAccountNumber,
     // pdf.js adapters
     textLinesFromItems, wordsFromItems, ocrResultToPage, preprocessForOcr,
     // export
