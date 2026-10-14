@@ -66,6 +66,9 @@
     --ink-faint: #8a8d96;
     --stamp: rgba(42, 79, 214, 0.6);
     --gutter: clamp(16px, 4vw, 48px);
+    /* One source of truth for page width: .wrap and .results both read it, so the
+       landing sections and the workbook view can never drift out of alignment. */
+    --content-max: 1280px;
 
     --font-ui: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
     --font-figures: "IBM Plex Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
@@ -165,7 +168,7 @@
 
   html { scroll-behavior: smooth; }
   .shell { flex: 1 0 auto; width: 100%; display: flex; flex-direction: column; }
-  .wrap { width: 100%; max-width: 1200px; margin-inline: auto; padding-inline: var(--gutter); }
+  .wrap { width: 100%; max-width: var(--content-max); margin-inline: auto; padding-inline: var(--gutter); }
 
   .brand { display: flex; align-items: center; gap: 10px; color: var(--text); text-decoration: none; }
   .brand svg { height: 26px; width: auto; display: block; }
@@ -200,7 +203,8 @@
     margin: 0; font-size: clamp(40px, 6.6vw, 78px); line-height: 1.02; font-weight: 700;
     letter-spacing: -0.035em; text-wrap: balance;
   }
-  .hero .lede { margin: 0; color: var(--text-secondary); font-size: 17px; line-height: 1.6; text-wrap: balance; }
+  /* Capped at a readable measure: unconstrained this ran ~115 characters on one line. */
+  .hero .lede { margin: 0; max-width: 60ch; color: var(--text-secondary); font-size: 17px; line-height: 1.6; text-wrap: balance; }
   .hero .banks { margin: -8px 0 0; font-size: 13px; color: var(--text-secondary); }
   .hero .banks span { color: var(--text-hint); }
   @media (max-width: 640px) { .wide-only { display: none; } }
@@ -285,7 +289,11 @@
   .drop { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; height: 120px; padding: 0 16px; border-style: dashed; cursor: pointer; text-align: center; }
   .drop:hover, .drop.dragging { border-color: var(--primary); background: var(--surface-hover); }
   .drop.selected { border-style: solid; border-color: var(--primary); background: var(--surface-selected); }
-  .drop.busy { cursor: progress; }
+  .drop.busy {
+    height: auto; min-height: 212px; cursor: progress;
+    border-style: solid; border-color: var(--primary); background: var(--surface-selected);
+  }
+  .drop.busy .drop-icon, .drop.busy .text { display: none; }
   .drop.done { cursor: default; border-style: solid; }
   .drop .text { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
   .drop .browse { flex: none; font-size: 13px; font-weight: 600; color: var(--primary-text); }
@@ -550,17 +558,35 @@
     font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-action);
   }
   .remove:hover { color: var(--error); }
-  .progress { margin-top: 24px; text-align: center; font-size: 13px; color: var(--text-hint); }
-  .progress .detail { display: block; font-family: var(--font-figures); font-size: 12px; margin-top: 2px; }
-  .bar { height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; margin: 10px auto 0; max-width: 260px; }
-  .bar { position: relative; }
-  .bar span { display: block; height: 100%; width: 0; background: var(--primary); transition: width 300ms; }
-  .bar.working::after {
-    content: ""; position: absolute; inset: 0; width: 40%;
-    background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--primary-text) 70%, transparent), transparent);
-    animation: bar-sweep 1.4s ease-in-out infinite;
+  /* ---------- extraction loader ----------
+     While extracting, the drop zone becomes the loader. The dots ripple out from the
+     centre at a fixed pace — they never track progress, because a filling indicator on
+     a 100-second OCR run mostly advertises how slow it is. The lines below carry the
+     actual progress, for people and for assistive tech. */
+  .loader { display: none; flex-direction: column; align-items: center; gap: 16px; width: 100%; }
+  .drop.busy .loader { display: flex; }
+  .dot-grid { display: grid; grid-template-columns: repeat(11, 1fr); gap: 4px; width: 105px; aspect-ratio: 1; }
+  .dot-grid i {
+    aspect-ratio: 1; border-radius: 50%; background: var(--primary);
+    opacity: 0.18; transform: scale(calc(var(--s) * 0.62));
+    animation: dot-ripple 2.8s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+    animation-delay: calc((1 - var(--d)) * -0.9s);   /* centre leads, edge trails */
+    will-change: transform, opacity;
   }
-  @keyframes bar-sweep { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+  @keyframes dot-ripple {
+    0%, 100% { opacity: 0.18; transform: scale(calc(var(--s) * 0.62)); }
+    50%      { opacity: 1;    transform: scale(var(--s)); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .dot-grid i { animation: none; opacity: 0.72; transform: scale(var(--s)); }
+  }
+  .loader-copy { display: flex; flex-direction: column; align-items: center; gap: 3px; max-width: 46ch; }
+  .loader-main { font-size: 15px; font-weight: 500; color: var(--text); text-wrap: balance; }
+  .loader-sub { font-size: 13px; color: var(--text-secondary); text-wrap: balance; }
+  .loader-count {
+    margin-top: 3px; font-family: var(--font-figures); font-size: 12px;
+    color: var(--text-hint); font-variant-numeric: tabular-nums;
+  }
 
   .btn-primary {
     height: 42px; min-width: 132px; padding: 0 20px; border: none; border-radius: var(--radius-md);
@@ -572,7 +598,7 @@
 
   /* ---------- workbook preview ---------- */
   .results {
-    display: flex; flex-direction: column; gap: 28px; min-width: 0; width: 100%; max-width: 1200px; /* same as .wrap */
+    display: flex; flex-direction: column; gap: 28px; min-width: 0; width: 100%; max-width: var(--content-max);
     margin-inline: auto; padding-inline: var(--gutter); padding-block: clamp(32px, 5vw, 48px) 64px;
   }
   .nav .link[aria-current="page"] { color: var(--text); font-weight: 500; }
@@ -683,6 +709,9 @@
   .total .k { font-size: 12px; color: var(--text-hint); }
   .total .v { font-family: var(--font-figures); font-size: 18px; font-weight: 500; font-variant-numeric: tabular-nums; }
   .total .v.neg { color: var(--negative); }
+  /* Net Total is the figure people came for: give it weight over the supporting tiles. */
+  .total.net .k { color: var(--text-secondary); font-weight: 600; }
+  .total.net .v { font-size: 24px; font-weight: 600; letter-spacing: -0.01em; }
   .total .v.review { color: var(--review-text); }
   button.total {
     border: 0; margin: 0; font: inherit; color: inherit; text-align: left; cursor: pointer; align-items: flex-start;
@@ -705,7 +734,12 @@
   .sheet-bar { display: flex; flex-wrap: wrap-reverse; align-items: flex-end; justify-content: space-between; gap: 12px 24px; border-bottom: 1px solid var(--border); }
   .tabs { display: flex; gap: 4px; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; margin-bottom: -1px; }
   .sheet-options { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 12px 20px; padding-bottom: 8px; margin-left: auto; }
-  .sheet-options .result-actions { gap: 8px; }
+  /* Separate the output options (left) from the actions (right) so the row reads as
+     two groups rather than one undifferentiated strip of controls. */
+  .sheet-options .result-actions { gap: 8px; padding-left: 20px; border-left: 1px solid var(--border); }
+  @media (max-width: 860px) {
+    .sheet-options .result-actions { padding-left: 0; border-left: none; }
+  }
   .sheet-options .result-actions button { height: 36px; }
   .sheet-bar .tab { padding: 8px 12px 17px; }
   .month-pick { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); }
@@ -996,9 +1030,6 @@
         <h1>Bank Statements to Excel.<br>Zero Uploads.</h1>
         <p class="lede">Turn bank statement PDFs into an Excel workbook in seconds, then add a one-click summary of your monthly cash flow.</p>
         <p class="banks"><span>Supports</span> Maybank · CIMB · Bank Islam · BSN <span>· more banks coming soon</span></p>
-        <div class="hero-actions">
-          <button class="text-link js-sample" type="button"><span>See a Sample</span><svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.75" y="2.25" width="12.5" height="11.5" rx="1.75" stroke="currentColor" stroke-width="1.5"/><path d="M1.75 6h12.5M1.75 9.75h12.5M6 6v7.75" stroke="currentColor" stroke-width="1.5"/></svg></button>
-        </div>
       </section>
 
       <div class="wrap">
@@ -1012,20 +1043,25 @@
 </svg></span>
               <span class="text" id="drop-title">Drag PDFs Here</span>
               <span class="browse" id="drop-browse">or Browse Files</span>
+              <div class="loader" id="progress">
+                <div class="dot-grid" id="dot-grid" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+                     aria-label="Extraction progress"></div>
+                <div class="loader-copy" role="status" aria-live="polite">
+                  <span class="loader-main" id="progress-detail"></span>
+                  <span class="loader-sub" id="progress-sub"></span>
+                  <span class="loader-count" id="progress-main"></span>
+                </div>
+              </div>
             </div>
             <span class="field-hint" id="drop-sub">Maybank, CIMB, Bank Islam or BSN PDF statements. You can add several, then add monthly sheets or a summary in the preview.</span>
           </div>
           <div class="files" id="files" hidden>
             <p class="overline" id="files-title"></p>
             <ul class="file-list" id="file-list"></ul>
-            <div class="progress" id="progress" hidden>
-              <span id="progress-main"></span>
-              <span class="detail" id="progress-detail"></span>
-              <div class="bar"><span id="progress-bar"></span></div>
-            </div>
           </div>
                     <div class="form-go">
             <p class="form-note">Your statements never leave your browser. Nothing is uploaded.</p>
+            <button class="text-link js-sample" type="button"><span>See a Sample</span><svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1.75" y="2.25" width="12.5" height="11.5" rx="1.75" stroke="currentColor" stroke-width="1.5"/><path d="M1.75 6h12.5M1.75 9.75h12.5M6 6v7.75" stroke="currentColor" stroke-width="1.5"/></svg></button>
             <button class="btn-secondary" id="reset-files" type="button" hidden>Reset</button>
             <button class="btn-secondary" id="cancel-extract" type="button" hidden>Cancel</button>
             <button class="btn-primary" id="extract" type="button" disabled>Extract Data</button>
@@ -4321,7 +4357,8 @@
     resetFiles: $("reset-files"),
     dropIcon: $("drop-icon"), dropBrowse: $("drop-browse"), dropTitle: $("drop-title"), dropSub: $("drop-sub"),
     files: $("files"), filesTitle: $("files-title"), fileList: $("file-list"),
-    progress: $("progress"), progressMain: $("progress-main"), progressDetail: $("progress-detail"), progressBar: $("progress-bar"),
+    progress: $("progress"), progressMain: $("progress-main"), progressDetail: $("progress-detail"),
+    progressSub: $("progress-sub"), dotGrid: $("dot-grid"),
     extract: $("extract"), newUpload: $("new-upload"), viewWorkbook: $("view-workbook"),
     viewUpload: $("view-upload"), viewResults: $("view-results"), resultsTitle: $("results-title"),
     exampleNote: $("example-note"), sources: $("sources"),
@@ -4651,8 +4688,8 @@
       return row;
     }));
 
-    el.progress.hidden = !busy;
-    el.progressBar.parentElement.classList.toggle("working", busy);
+    // The loader lives inside the drop zone; .busy on the zone is what reveals it.
+    if (!busy) el.dotGrid.removeAttribute("aria-valuenow");
     el.extract.hidden = phase === "done";
     $("cancel-extract").hidden = !busy;
     el.extract.disabled = !files.length || busy;
@@ -5088,10 +5125,42 @@
   // Extraction (src/pipeline.process_documents)
   // ------------------------------------------------------------------
 
+  // Builds the ripple once. Dot size falls off from the centre, so the disc keeps its
+  // silhouette; --d drives each dot's phase so the wave travels outward.
+  function buildDots(n) {
+    const c = (n - 1) / 2;
+    const dots = [];
+    for (let row = 0; row < n; row += 1) {
+      for (let col = 0; col < n; col += 1) {
+        const d = Math.min(1, Math.hypot((col - c) / c, (row - c) / c));
+        const dot = document.createElement("i");
+        dot.style.setProperty("--s", Math.max(0.1, 1 - d * d).toFixed(3));
+        dot.style.setProperty("--d", d.toFixed(3));
+        dots.push(dot);
+      }
+    }
+    el.dotGrid.replaceChildren(...dots);
+  }
+  buildDots(11);
+
+  let progressCount = "";
+
+  // `detail` is the live message and becomes the headline; a second sentence in it drops
+  // to the quieter line. `main` is the file counter, which sits last and smallest.
   function setProgress(main, detail, fraction) {
-    if (main !== undefined) el.progressMain.textContent = main;
-    if (detail !== undefined) el.progressDetail.textContent = detail;
-    if (fraction !== undefined) el.progressBar.style.width = `${Math.round(Math.min(1, Math.max(0, fraction)) * 100)}%`;
+    if (main !== undefined) progressCount = main;
+    if (detail !== undefined) {
+      const split = detail.indexOf(". ");
+      el.progressDetail.textContent = split === -1 ? detail : detail.slice(0, split + 1);
+      el.progressSub.textContent = split === -1 ? "" : detail.slice(split + 2);
+    }
+    if (fraction !== undefined) {
+      const percent = Math.round(Math.min(1, Math.max(0, fraction)) * 100);
+      el.dotGrid.setAttribute("aria-valuenow", percent);
+      el.progressMain.textContent = progressCount ? `${progressCount} · ${percent}%` : `${percent}%`;
+    } else if (main !== undefined) {
+      el.progressMain.textContent = progressCount;
+    }
   }
 
   async function extract() {
@@ -5125,7 +5194,8 @@
       const entry = state.files[index];
       entry.status = "Reading";
       renderUpload();
-      setProgress(`Processing ${index + 1} of ${total}: ${entry.file.name}`, "Reading the text layer", index / total);
+      // The filename is already in the list above, so the counter stays short.
+      setProgress(`File ${index + 1} of ${total}`, "Reading the text layer", index / total);
       let doc = null;
       try {
         const report = (detail, pageFraction) => {
@@ -5203,7 +5273,7 @@
       }
     }
 
-    setProgress("Building the workbook preview", "", 1);
+    setProgress("", "Building the workbook preview", 1);
     const checks = new Map(parsed.map((outcome) => [outcome, Core.statementCheck(outcome)]));
     const previous = current || {};   // keep the last file name and monthly choice
     state.real = state.result = {
@@ -5387,7 +5457,7 @@
       const totals = Core.summarize(transactions);
       tiles.push(totalTile("Total Credit", formatMoney(totals.credit)));
       tiles.push(totalTile("Total Debit", formatMoney(totals.debit)));
-      tiles.push(totalTile("Net Total", (totals.net < 0 ? "-" : "") + formatMoney(Math.abs(totals.net)), totals.net < 0 ? "neg" : ""));
+      tiles.push(totalTile("Net Total", (totals.net < 0 ? "-" : "") + formatMoney(Math.abs(totals.net)), totals.net < 0 ? "neg" : "", "net"));
     } else {
       const sum = transactions.reduce((acc, t) => acc + Core.amountCents(t), 0);
       tiles.push(totalTile(`Total ${direction}`, formatMoney(sum)));
