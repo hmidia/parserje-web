@@ -3036,16 +3036,46 @@
     return out;
   }
 
+  // A misread balance leaves a mark no other error does: its row is off by X and the next row by
+  // -X, because the next amount runs from the misread figure. A missing row or a misread amount
+  // leaves a single gap. So when two gaps cancel, and the balance worked out from the row above
+  // differs from the one read in at most two digits, the balance is corrected and flagged.
+  function correctPairedBalanceGaps(transactions) {
+    const gapAt = (index, balance) => {
+      const previous = signedAmountCents(transactions[index - 1].Balance);
+      const amount = signedAmountCents(transactions[index].Amount);
+      if (previous === null || amount === null || balance === null || transactionDirection(transactions[index]) === "Unknown") return null;
+      return balance - previous - amount;
+    };
+    for (let index = 1; index + 1 < transactions.length; index += 1) {
+      const row = transactions[index];
+      const next = transactions[index + 1];
+      const read = signedAmountCents(row.Balance);
+      const gap = gapAt(index, read);
+      const nextGap = gapAt(index + 1, signedAmountCents(next.Balance));
+      if (gap === null || nextGap === null || Math.abs(gap) <= 2 || Math.abs(gap + nextGap) > 2) continue;
+      const corrected = read - gap;
+      const before = String(Math.abs(read));
+      const after = String(Math.abs(corrected));
+      if (corrected < 0 || before.length !== after.length || Array.from(before).filter((digit, at) => digit !== after[at]).length > 2) continue;
+      row.Balance = formatCents(corrected);
+      row._low_confidence_fields = sortedUnique(new Set([...(row._low_confidence_fields || []), "Balance"]));
+      for (const item of [row, next]) if (item._review_status === "Reconcile balance gap") delete item._review_status;
+    }
+    return transactions;
+  }
+
   // A row whose balance doesn't follow from the one above usually has a misread amount (a stamp
   // across the figure, a 1 read as a 4). Take the amount from the balance change only when that
   // one row then makes the rows add up to the debit and credit totals the statement prints. Any
   // doubt (no printed totals, or no single row that fits) leaves the rows as read. Stays flagged.
-  function correctAmountFromPrintedTotals(transactions, summary) {
+  // opening (cents, optional): the balance before the first row, so the first row can be checked too.
+  function correctAmountFromPrintedTotals(transactions, summary, opening) {
     if (!summary || summary.debit === null || summary.credit === null) return transactions;
     const totals = summarize(transactions);
     if (totals.debit === summary.debit && totals.credit === summary.credit) return transactions;
     const fits = [];
-    let previousBalance = null;
+    let previousBalance = opening === undefined ? null : opening;
     for (const transaction of transactions) {
       const amount = signedAmountCents(transaction.Amount);
       const balance = signedAmountCents(transaction.Balance);
@@ -3065,6 +3095,7 @@
     transaction._low_confidence_fields = sortedUnique(new Set([...(transaction._low_confidence_fields || []), "Amount"]));
     return transactions;
   }
+
   // verdict: "verified" (matches the statement), "mismatch" (doesn't), "unchecked" (nothing to check against)
   function reconcile(outcome) {
     const rows = outcome.transactions || [];
@@ -3119,7 +3150,8 @@
   const SIGNED_NUMBER_RE = /\b\d+(?:[.,]\d{2})?[+-]\b/;
   const DAMAGED_INTEGER_AMOUNT_RE = /(?<!\d)\d{1,4}[+-](?!\w)/;
   const DAMAGED_COMPACT_AMOUNT_RE = /(?<!\d)\d{1,3}(?:,\d{3}){1,2}(?![.,]\d{2})(?!\d)/;
-  const SHORT_DATE_RE = /([0-3OQ]?[0-9OQIL])\s*[/.-fF]\s*([01OQ]?[0-9OQIL])/;
+  // Web-only: a 1 read as I or L is accepted in either digit, so "OL/LL" is 01/11, not 01/01.
+  const SHORT_DATE_RE = /([0-3OQIL]?[0-9OQIL])\s*[/.-fF]\s*([01OQIL]?[0-9OQIL])/;
   const FULL_DATE_RE = /([0-3]\d)\s*[/.-]\s*(0\d|1[0-2])\s*[/.-]\s*(\d{2})/;
 
   function ocrLineText(line) {
@@ -3129,18 +3161,57 @@
   async function parseMaybankScannedStatement(doc) {
     const transactions = [];
     let previousPageBalance = null;
+    // Web-only: one PDF can hold several monthly statements, each opening with BEGINNING BALANCE
+    // and closing with its own printed totals. Kept apart so each can be checked against its own.
+    const sections = [];
 
     for (let pageIndex = 0; pageIndex < doc.pageCount; pageIndex += 1) {
       const { lines } = await doc.ocrPage(pageIndex);
+      const text = lines.map(ocrLineText);
+      if (!sections.length || text.some((line) => normalizeOcrText(line).includes("BEGINNING BALANCE"))) {
+        sections.push({ transactions: [], text: [], opening: signedAmountCents(mbOpeningBalance(lines)) });
+      }
+      const section = sections[sections.length - 1];
       const statementDate = mbStatementDate(lines);
       const pageTransactions = mbParseTable(lines, statementDate, previousPageBalance);
       transactions.push(...pageTransactions);
+      section.transactions.push(...pageTransactions);
+      section.text.push(...text);
       if (pageTransactions.length) {
         previousPageBalance = pageTransactions[pageTransactions.length - 1].Balance;
       }
     }
 
-    return mbHasReliableLayout(transactions) ? transactions : [];
+    if (!mbHasReliableLayout(transactions)) return [];
+    correctPairedBalanceGaps(transactions);
+    for (const section of sections) {
+      correctAmountFromPrintedTotals(section.transactions, statementSummary(section.text), section.opening);
+    }
+    return transactions;
+  }
+
+  // OCR can misread a date (01/11 read as 01/01), which drops the row into the wrong month and
+  // year. Statement rows run in date order, so a scanned row dated outside the two rows around it,
+  // when those two are at most a day apart, takes their date: the one whose day it read, else the
+  // earlier. It stays flagged for checking. Rows whose neighbours don't pin a date are left as read.
+  function recoverOutOfOrderDates(transactions) {
+    const dayNumber = (date) => Date.UTC(date.y, date.m - 1, date.d) / 86400000;
+    const dated = transactions.filter((transaction) => transaction._transaction_date);
+    dated.forEach((transaction, index) => {
+      const previous = dated[index - 1];
+      const next = dated[index + 1];
+      if (!previous || !next) return;
+      const before = dayNumber(previous._transaction_date);
+      const after = dayNumber(next._transaction_date);
+      const own = dayNumber(transaction._transaction_date);
+      if ((own >= before && own <= after) || after < before || after - before > 1) return;
+      const source = transaction._transaction_date.d === next._transaction_date.d ? next : previous;
+      const date = source._transaction_date;
+      transaction._transaction_date = { ...date };
+      transaction.Date = `${pad2(date.d)}/${pad2(date.m)}`;
+      transaction._low_confidence_fields = sortedUnique(new Set([...(transaction._low_confidence_fields || []), "Date"]));
+    });
+    return transactions;
   }
 
   function mbHasReliableLayout(transactions) {
@@ -3248,6 +3319,15 @@
         ) {
           shortDate = nextDate;
           inferred = true;
+        } else if (
+          // Web-only: no usable month (". OL" for 01/11 reads a stray dot as the separator). A row
+          // with an amount and a balance is money on the statement, and rows run in date order, so
+          // rather than drop it, take the date the rows around it pin.
+          nextDate !== null && previousDate !== null &&
+          nextDate[1] === previousDate[1] && nextDate[0] - previousDate[0] >= 0 && nextDate[0] - previousDate[0] <= 1
+        ) {
+          shortDate = mbPartialDay(line) === nextDate[0] ? nextDate : previousDate;
+          inferred = true;
         }
       }
       if (shortDate !== null) recovered.push([line, shortDate, amount, damaged, balance, inferred]);
@@ -3255,9 +3335,14 @@
     return recovered;
   }
 
+  function mbPartialDay(line) {
+    const match = /([0-3OQIL]?[0-9OQIL])/.exec(mbColumnText(line, 0, DATE_COLUMN_RIGHT));
+    return match ? Number(mbOcrNumber(match[1])) : null;
+  }
+
   function mbPartialMonth(line) {
     const text = mbColumnText(line, 0, DATE_COLUMN_RIGHT);
-    const match = /[/.-fF]\s*([01OQ]?[0-9OQIL])/.exec(text);
+    const match = /[/.-fF]\s*([01OQIL]?[0-9OQIL])/.exec(text);
     if (!match) return null;
     const month = Number(mbOcrNumber(match[1]));
     return month >= 1 && month <= 12 ? month : null;
@@ -3272,14 +3357,22 @@
     return amount.startsWith(".") || amount.startsWith("00.") || !(amount.endsWith("+") || amount.endsWith("-"));
   }
 
+  // Web-only: SHORT_DATE_RE's separator [/.-fF] is a character range (. to f), so it also
+  // accepts digits and capitals; "QO7/11" read as day Q, month 7. A strict pattern goes first
+  // (real separators, any letter case, so "2i/i1" is 21/11), the loose one stays as the fallback
+  // for slashes OCR misread, and only a real day and month count as a date.
+  const SHORT_DATE_STRICT_RE = /([0-3OQIL]?[0-9OQIL])\s*[/.\-fF]\s*([01OQIL]?[0-9OQIL])/i;
+
   function mbLineDate(line) {
     const text = mbColumnText(line, 0, DATE_COLUMN_RIGHT);
-    const match = SHORT_DATE_RE.exec(text);
-    if (!match) return null;
-    const day = Number(mbOcrNumber(match[1]));
-    const month = Number(mbOcrNumber(match[2]));
-    if (!Number.isInteger(day) || !Number.isInteger(month)) return null;
-    return [day, month];
+    for (const pattern of [SHORT_DATE_STRICT_RE, SHORT_DATE_RE]) {
+      const match = pattern.exec(text);
+      if (!match) continue;
+      const day = Number(mbOcrNumber(match[1]));
+      const month = Number(mbOcrNumber(match[2]));
+      if (Number.isInteger(day) && Number.isInteger(month) && day >= 1 && day <= 31 && month >= 1 && month <= 12) return [day, month];
+    }
+    return null;
   }
 
   function mbColumnMoney(line, left, right) {
@@ -3287,8 +3380,10 @@
       .filter(([position, word]) => position >= left && (right === null || position < right) && word !== "." && word !== ",")
       // Tesseract.js (WebAssembly) sometimes attaches a stray "." to the end
       // of a balance that Tesseract 5.5 returns as its own word; drop it the
-      // same way the Python parser drops standalone "." words.
-      .map((word) => word[1].replace(/(\d)\.$/, "$1"))
+      // same way the Python parser drops standalone "." words. Web-only: only
+      // after the cents, since a balance split at its point ("946,768." "13")
+      // ends its first word with the real decimal point.
+      .map((word) => word[1].replace(/([.,]\d{2})\.$/, "$1"))
       .join("");
     const matches = findAll(MB_MONEY_RE, text);
     if (!matches.length) return null;
@@ -3304,6 +3399,9 @@
     if (SIGNED_NUMBER_RE.test(text) || DAMAGED_INTEGER_AMOUNT_RE.test(text) || DAMAGED_COMPACT_AMOUNT_RE.test(text)) {
       return [null, true];
     }
+    // Web-only: digits that don't read as money ("372,041.644", an extra digit) are still an
+    // amount; with a balance on the line it's taken from the balance change and flagged.
+    if ((text.match(/\d/g) || []).length >= 3) return [null, true];
     return [null, false];
   }
 
@@ -3538,7 +3636,7 @@
 
     step("Scanning pages with OCR");
     const scanned = await parseMaybankScannedStatement(doc);
-    if (scanned.length) return { bank: MAYBANK, method: "ocr", transactions: scanned };
+    if (scanned.length) return { bank: MAYBANK, method: "ocr", transactions: recoverOutOfOrderDates(scanned) };
 
     const ocrLines = [];
     for (let pageIndex = 0; pageIndex < doc.pageCount; pageIndex += 1) {
@@ -3561,7 +3659,7 @@
     return {
       bank,
       method: "ocr",
-      transactions: applyStatementYear(correctAmountFromPrintedTotals(parseTransactions(cleanLines(ocrLines)), ocrSummary), statementDate),
+      transactions: recoverOutOfOrderDates(applyStatementYear(correctAmountFromPrintedTotals(parseTransactions(cleanLines(ocrLines)), ocrSummary), statementDate)),
     };
   }
 
