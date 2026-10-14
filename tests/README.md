@@ -74,8 +74,9 @@ as the site's `ocrPage(i)` returns it — beside the PDF as `<name>.ocr.json`, a
 parsed from that like any other fixture. It's as private as the PDF and gitignored with it.
 A scanned fixture without one reports `SKIP`.
 
-Replaying tests the parsing of a scan, not the OCR itself. That still needs testing by hand,
-in the browser, per CUJ-02 in `.ux/cujs.md`.
+Replaying tests the parsing of a scan, not the OCR itself. That still needs checking by hand
+in the browser: convert a scanned statement on the live site and confirm the scan reader
+starts, every page is read, and anything it couldn't verify is shaded and flagged.
 
 ## How it finds the parser
 
