@@ -622,6 +622,8 @@
   .results-head h2:focus { outline: none; }
   .sources-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
   .results-desc { margin: 0; font-size: 14px; line-height: 1.55; color: var(--text-secondary); }
+  .results-account { margin: 0; font-size: 14px; color: var(--text-secondary); overflow-wrap: anywhere; }
+  .results-account b { font-family: var(--font-figures); font-weight: 500; color: var(--text); font-variant-numeric: tabular-nums; }
   .results-head h2 { margin: 0; font-size: clamp(24px, 3vw, 32px); font-weight: 700; letter-spacing: -0.02em; }
   .file-chip { font-family: var(--font-figures); font-size: 13px; color: var(--text-secondary); overflow-wrap: anywhere; }
   .example-note {
@@ -720,6 +722,12 @@
   button.total:focus-visible { outline: 2px solid var(--primary-text); outline-offset: -2px; }
   button.total[aria-pressed="true"] { box-shadow: inset 0 -2px 0 var(--review-text); }
   .total .act { font-size: 12px; font-weight: 600; color: var(--primary-text); }
+  .total.closing.off { background: linear-gradient(var(--review-bg), var(--review-bg)), var(--surface); }
+  .total .verdict { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; }
+  .total .verdict svg { flex: none; }
+  .total .verdict.ok { color: var(--success); }
+  .total .verdict.off { color: var(--review-text); }
+  .total .verdict.na { color: var(--text-hint); font-weight: 500; }
   button.total:hover .act { text-decoration: underline; text-underline-offset: 3px; }
   .filter-note {
     margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 10px 14px;
@@ -1057,7 +1065,7 @@
                 </div>
               </div>
             </div>
-            <span class="field-hint" id="drop-sub">Maybank, CIMB, Bank Islam or BSN PDF statements. You can add several, then add monthly sheets or a summary in the preview.</span>
+            <span class="field-hint" id="drop-sub">One account at a time. Add as many statements from that account as you like — they'll be merged in date order.</span>
           </div>
           <div class="files" id="files" hidden>
             <p class="overline" id="files-title"></p>
@@ -1248,6 +1256,7 @@
     </div>
     <div class="rgroup results-head">
       <h2 id="results-title" tabindex="-1">Workbook Preview</h2>
+      <p class="results-account" id="results-account" hidden></p>
       <p class="results-desc" id="keep-note" hidden>This workbook isn't saved anywhere. It only exists in this tab, so extracting new statements or closing the tab removes it. Download Excel to keep a copy.</p>
       <p class="results-desc" id="example-note">These are sample rows for a made-up company. Click Convert Statements above to see your own.</p>
     </div>
@@ -4028,7 +4037,7 @@
   const DATE_NUMBER_FORMAT = "dd/mm/yyyy";
   const LOW_CONFIDENCE_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFEF3C7" } };
   const FIELD_COLUMNS = { Date: 1, Description: 2, "Transaction Type": 3, Amount: 4, Balance: 5 };
-  const TABLE_HEADER_ROW = 6;
+  const TABLE_HEADER_ROW = 8;
   const CREATOR_FOOTER = "Parserje v0.9.0 Beta • Designed by Midi • Build 2026.09.08";
   const MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
@@ -4132,9 +4141,11 @@
   }
 
   // note: one line in the free row above the table (e.g. pointing to Duplicates Removed).
-  function writeSheet(sheet, transactions, direction, note) {
+  // account: workbookAccount(), stated first so the sheet says which account it covers.
+  // closing: closingSummary(), the same Closing Balance and verdict the preview shows.
+  function writeSheet(sheet, transactions, direction, note, account, closing) {
     const header = TABLE_HEADER_ROW;
-    writeSummary(sheet, transactions, direction);
+    writeSummary(sheet, transactions, direction, account, closing);
     if (note) {
       const noteCell = sheet.getCell(header - 1, 1);
       noteCell.value = note;
@@ -4209,21 +4220,31 @@
     return { credit, debit, net: credit - debit, count: transactions.length };
   }
 
-  function writeSummary(sheet, transactions, direction) {
+  // The same figures as the preview's tiles: the totals, the Closing Balance with its verdict
+  // beside it, and how many rows on this sheet need checking.
+  function writeSummary(sheet, transactions, direction, account, closing) {
     let rows;
     if (direction !== null) {
       const total = transactions.reduce((sum, t) => sum + amountCents(t), 0);
-      rows = [[`Total ${direction}`, total / 100, "#,##0.00"], ["Total Transactions", transactions.length, "#,##0"]];
+      rows = [[`Total ${direction}`, total / 100, "#,##0.00"]];
     } else {
       const totals = summarize(transactions);
       rows = [
         ["Total Credit", totals.credit / 100, "#,##0.00"],
         ["Total Debit", totals.debit / 100, "#,##0.00"],
         ["Net Total", totals.net / 100, AMOUNT_NUMBER_FORMAT],
-        ["Total Transactions", transactions.length, "#,##0"],
       ];
     }
-    rows.forEach(([label, value, format], index) => {
+    // Text, so Excel never turns a long account number into 5.14E+11.
+    if (account) rows.unshift(["Account", accountLabel(account), "@"]);
+    if (closing) {
+      // A mismatch is shaded like a flagged cell: something to look at, not a failure.
+      const tone = { ok: { font: SUMMARY_TONE_FONTS.ok }, off: { fill: LOW_CONFIDENCE_FILL }, na: { font: SUMMARY_TONE_FONTS.na } }[closing.state];
+      rows.push(["Closing Balance", closing.closing === null ? "—" : closing.closing / 100, AMOUNT_NUMBER_FORMAT, { text: closing.text, ...tone }]);
+    }
+    const review = transactions.filter(needsReview).length;
+    rows.push(["Needs Checking", review, "#,##0", review ? { fill: LOW_CONFIDENCE_FILL } : null]);
+    rows.forEach(([label, value, format, extra], index) => {
       const labelCell = sheet.getCell(index + 1, 1);
       const valueCell = sheet.getCell(index + 1, 2);
       labelCell.value = label;
@@ -4231,6 +4252,14 @@
       labelCell.font = { bold: true };
       valueCell.font = { bold: true };
       valueCell.numFmt = format;
+      if (!extra) return;
+      if (extra.fill) valueCell.fill = extra.fill;
+      if (extra.text) {
+        const noteCell = sheet.getCell(index + 1, 3);
+        noteCell.value = extra.text;
+        noteCell.font = extra.font ? { bold: true, color: { argb: extra.font } } : { bold: true };
+        if (extra.fill) noteCell.fill = extra.fill;
+      }
     });
   }
 
@@ -4297,16 +4326,19 @@
   }
 
   // options.duplicates: removeOverlaps().removed. Its sheet exists only when something was removed.
+  // options.account: workbookAccount(), shown at the top of each transaction sheet.
+  // options.statements: statementTotals() + check per PDF, for the Closing Balance row.
   async function buildWorkbook(ExcelJS, transactions, options) {
     const workbook = new ExcelJS.Workbook();
     workbook.creator = "Parserje";
     const duplicates = options.duplicates || [];
+    const closing = options.statements ? closingSummary(options.statements) : null;
     const pointer = duplicates.length
       ? `${duplicates.length} ${duplicates.length === 1 ? "row was" : "rows were"} removed as duplicates of overlapping statements. See Duplicates Removed.`
       : "";
     if (options.summary) writeSummarySheet(workbook.addWorksheet("Summary"), options.summary);
     for (const [title, sheetTransactions, direction] of sheetPlan(transactions, options.includeMonthly)) {
-      writeSheet(workbook.addWorksheet(title), sheetTransactions, direction, title === "All" ? pointer : "");
+      writeSheet(workbook.addWorksheet(title), sheetTransactions, direction, title === "All" ? pointer : "", options.account, closing);
     }
     if (duplicates.length) writeDuplicatesSheet(workbook.addWorksheet("Duplicates Removed"), duplicates);
     return workbook.xlsx.writeBuffer();
@@ -4391,6 +4423,32 @@
     return check;
   }
 
+  // The account a workbook covers, from the statements in it: the bank and number most of them
+  // agree on (so one scan's misread digit isn't the one shown), the full number over a masked one
+  // when both are the same account. Null when no statement's number could be read.
+  function workbookAccount(outcomes) {
+    const counted = (values) => {
+      const counts = new Map();
+      for (const value of values) counts.set(value, (counts.get(value) || 0) + 1);
+      return Array.from(counts).sort((a, b) => b[1] - a[1]);
+    };
+    const mostCommon = (values) => (values.length ? counted(values)[0][0] : null);
+    const numbers = outcomes.map((outcome) => outcome.accountNumber).filter(Boolean);
+    if (!numbers.length) return null;
+    const full = numbers.filter((number) => !number.includes("*"));
+    const ranked = counted(full.length ? full : numbers);
+    // No majority between differing readings (two scans, one digit apart): show only the last four,
+    // which they share, rather than pick one that may be misread.
+    const tied = ranked.length > 1 && ranked[0][1] === ranked[1][1];
+    const number = tied ? "*".repeat(ranked[0][0].length - 4) + ranked[0][0].slice(-4) : ranked[0][0];
+    const banks = outcomes.map((outcome) => outcome.bank).filter((bank) => bank && bank !== UNKNOWN);
+    return { bank: mostCommon(banks.length ? banks : outcomes.map((outcome) => outcome.bank)), number };
+  }
+
+  function accountLabel(account) {
+    return `${BANK_LABELS[account.bank] || account.bank} · ${account.number.replace(/\*/g, "•")}`;
+  }
+
   // ------------------------------------------------------------------
   // Overlapping statements of one account (Jan–Mar and Feb–Apr both carry February)
   // ------------------------------------------------------------------
@@ -4439,6 +4497,33 @@
       }
     }
     return { transactions: kept, removed, flagged };
+  }
+
+  // Closing Balance, for the preview tile and the workbook alike: the latest statement's closing
+  // figure, and whether every statement's rows run from its opening balance to its closing one.
+  // statements: statementTotals() + check for each PDF. state: "ok", "off" or "na".
+  function closingSummary(statements) {
+    const order = (statement) => (statement.last ? dateKey(statement.last) : 0);
+    const latest = statements.filter((statement) => statement.closing !== null)
+      .reduce((best, statement) => (!best || order(statement) >= order(best) ? statement : best), null);
+    const checks = statements.map((statement) => statement.check || { verdict: "unchecked", reasons: [] });
+    const failed = checks.filter((check) => check.verdict === "mismatch");
+    let state = "na";
+    if (latest && failed.length) state = "off";
+    else if (latest && checks.length && checks.every((check) => check.verdict === "verified")) state = "ok";
+    let text = "Can't be checked";
+    if (state === "ok") text = "Balances";
+    if (state === "off") {
+      // How far out, added up across the statements that don't reconcile.
+      const amounts = failed.map((check) => {
+        const reason = check.reasons.find((item) => ["balance", "debit", "credit"].includes(item.kind));
+        return reason ? Math.abs(reason.extracted - reason.statement) : null;
+      });
+      text = amounts.every((amount) => amount !== null)
+        ? `Off by ${formatCents(amounts.reduce((sum, amount) => sum + amount, 0))}`
+        : "Doesn't match the statement";
+    }
+    return { closing: latest ? latest.closing : null, state, text };
   }
 
   function checkShortReason(check) {
@@ -4695,7 +4780,7 @@
     parseBankIslamTransactions, parseMaybankScannedStatement, detectBank,
     statementDateFromHeader, applyStatementYear, sortTransactions, transactionsByMonth, MONTH_NAMES,
     parseBankIslamTable, statementSummary, reconcile, isLegacyBankIslamLayout,
-    accountNumbersFromLines, sameAccountNumber, removeOverlaps,
+    accountNumbersFromLines, sameAccountNumber, removeOverlaps, workbookAccount, accountLabel, closingSummary,
     // pdf.js adapters
     textLinesFromItems, wordsFromItems, ocrResultToPage, preprocessForOcr,
     // export
@@ -5088,7 +5173,7 @@
       } else {
         el.dropTitle.textContent = "Drag PDFs Here";
         el.dropBrowse.textContent = "or Browse Files";
-        el.dropSub.textContent = "Maybank, CIMB, Bank Islam or BSN PDF statements. You can add several, then add monthly sheets or a summary in the preview.";
+        el.dropSub.textContent = "One account at a time. Add as many statements from that account as you like — they'll be merged in date order.";
       }
     }
 
@@ -5836,6 +5921,7 @@
       leftOut,
       duplicates: merged.removed,
       possibleDuplicates: merged.flagged,
+      account: Core.workbookAccount(parsed),
       summary: null,
       statements: parsed.map((outcome) => ({ ...Core.statementTotals(outcome), check: checks.get(outcome) })),
       sources: parsed.map((outcome) => ({
@@ -5910,6 +5996,31 @@
     v.className = "v" + (className ? " " + className : "");
     v.textContent = value;
     tile.append(k, v);
+    return tile;
+  }
+
+  const VERDICT_ICONS = {
+    ok: '<svg aria-hidden="true" width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.2 3L13 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    off: '<svg aria-hidden="true" width="12" height="12" viewBox="0 0 20 20" fill="none"><path d="M10 3.2 18 17H2L10 3.2Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M10 8.2v4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="10" cy="14.6" r="1" fill="currentColor"/></svg>',
+    na: "",
+  };
+
+  // Closing Balance: the latest statement's closing figure, carrying the check that matters most on
+  // the page: whether every statement's rows run from its opening balance to its closing one. It
+  // describes the whole workbook, so it reads the same whichever month or tab is showing.
+  function closingTile(result) {
+    const { closing, state, text } = Core.closingSummary(result.statements || []);
+    const tile = totalTile(
+      "Closing Balance",
+      closing === null ? "—" : (closing < 0 ? "-" : "") + formatMoney(Math.abs(closing)),
+      state === "off" ? "review" : "",
+      "closing" + (state === "off" ? " off" : ""),
+    );
+    const verdict = document.createElement("span");
+    verdict.className = `verdict ${state}`;
+    verdict.innerHTML = VERDICT_ICONS[state];
+    verdict.append(text);
+    tile.append(verdict);
     return tile;
   }
 
@@ -6006,6 +6117,13 @@
     $("clear-workbook").hidden = result.example;
     renderAlert(result);
     renderDuplicatesNote(result);
+    const account = $("results-account");
+    account.hidden = !result.account;
+    if (result.account) {
+      const number = document.createElement("b");
+      number.textContent = result.account.number.replace(/\*/g, "•");
+      account.replaceChildren(`${bankLabel(result.account.bank)} · Account `, number);
+    }
     $("sources-row").hidden = !result.sources.length;
     el.sources.replaceChildren(...result.sources.map((source) => {
       const chip = document.createElement("li");
@@ -6042,7 +6160,7 @@
       const sum = transactions.reduce((acc, t) => acc + Core.amountCents(t), 0);
       tiles.push(totalTile(`Total ${direction}`, formatMoney(sum)));
     }
-    tiles.push(totalTile("Total Transactions", transactions.length.toLocaleString("en-US")));
+    tiles.push(closingTile(result));
     if (!review) state.onlyFlagged = false;
     const needsTile = totalTile("Needs Checking", review.toLocaleString("en-US"), review ? "review" : "", "needs" + (review ? " has" : ""));
     if (review) {
@@ -6488,6 +6606,8 @@
         includeMonthly: result.monthly,
         summary: result.summary ? summaryFor(result) : null,
         duplicates: result.duplicates,
+        account: result.account,
+        statements: result.statements,
       });
       const filename = `${Core.filenamePrefix(result.company)}.xlsx`;
       const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
