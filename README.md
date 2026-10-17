@@ -6,7 +6,7 @@ Your statements are never uploaded. There is no server, no account, and no stora
 is read in the browser tab, parsed in memory, and the resulting `.xlsx` is written to a blob
 the browser hands straight to your downloads folder. Closing the tab destroys everything.
 
-**Live:** https://USERNAME.github.io/parserje/
+**Live:** https://parserje.com
 
 ## Why it works this way
 
@@ -21,8 +21,8 @@ This repo being public is part of that claim. You can read every line that touch
 It's a single static page with no build step:
 
 ```bash
-git clone https://github.com/USERNAME/parserje.git
-cd parserje
+git clone https://github.com/hmidia/parserje-web.git
+cd parserje-web
 python3 -m http.server 8000
 ```
 
