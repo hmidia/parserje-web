@@ -1623,6 +1623,12 @@
 
   function detectTransactionType(text) {
     const compact = normalizeOcrText(text).split(" ").join("");
+    // Web-only: Maybank card and online-banking labels, ahead of the generic PAYMENT / TRANSFER.
+    // Soft copies cut "FPX PAYMENT FR A/C" to "FPX PAYMENT FR A/".
+    if (compact.includes("SALEDEBIT")) return "SALE DEBIT";
+    if (compact.includes("PAYMENTVIAMYDEBIT")) return "PAYMENT VIA MYDEBIT";
+    if (compact.includes("IBKFUNDTFRTOAC")) return "IBK FUND TFR TO A/C";
+    if (compact.includes("FPXPAYMENTFRA")) return "FPX PAYMENT FR A/C";
     if (compact.includes("ELECTRONICREMITTANCEGIR")) return "ELECTRONIC REMITTANCE - GIR";
     if (compact.includes("INTERBANKPAYMENTINTOAC")) return "INTER-BANK PAYMENT INTO A/C";
     if (compact.includes("PAYMENTFRAC")) return "PAYMENT FR A/C";
@@ -3481,6 +3487,202 @@
     return value.toUpperCase().replace(/[OQ]/g, "0").replace(/[IL]/g, "1");
   }
 
+  // Web-only: the figures a Maybank statement prints about itself, read from its text lines,
+  // one per printed row. BEGINNING BALANCE heads the first page, ENDING BALANCE follows the
+  // last row, and TOTAL DEBIT / TOTAL CREDIT close the statement. Maybank prints no row
+  // counts, so any other number beside a total is not compared.
+  const MB_FIGURE_RE = /((?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2})(\s*(?:-|DR\b))?/g;
+
+  function mbStatementFigures(lines) {
+    const { debit, credit } = statementSummary(lines);
+    let opening = null;
+    let closing = null;
+    for (const line of lines) {
+      const normalized = normalizeOcrText(line);
+      // The footer legend "LEDGER * ENDING BALANCE - UNCLEARED CHEQUES" is not a figure.
+      if (/\bUNCLEARED\b/.test(normalized)) continue;
+      const isOpening = /\bBEGINNING BALANCE\b/.test(normalized);
+      const isClosing = /\bENDING BALANCE\b/.test(normalized);
+      if (!isOpening && !isClosing) continue;
+      const figures = findAll(MB_FIGURE_RE, String(line));
+      if (!figures.length) continue;
+      const last = figures[figures.length - 1];
+      const cents = toCents(last.replace(/[^\d.]/g, ""));
+      const value = cents === null ? null : /-|DR/.test(last) ? -cents : cents;
+      if (isOpening && opening === null) opening = value;
+      else if (isClosing) closing = value;
+    }
+    return { summary: { debit, credit, debitCount: null, creditCount: null }, opening, closing };
+  }
+
+  // Web-only: where the running balance proves what an amount must be, use it.
+  //  - An amount that lost its sign takes the sign of the balance change when the figures match.
+  //  - An amount that disagrees with the balance change is replaced only when the balance before
+  //    it and its own balance are each confirmed: by the neighbouring row's amount carrying the
+  //    balance on, or by the printed opening / ending balance. Otherwise it is left as read.
+  // Either way the Amount is flagged, so the row still asks to be checked.
+  function mbRepairAmountsFromBalances(transactions, opening, closing) {
+    const balances = transactions.map(balanceCents);
+    const amounts = transactions.map(signedCents);   // null when the sign or the amount is missing
+    const before = (i) => (i === 0 ? opening : balances[i - 1]);
+    // Whether row i's amount, as read, carries the balance before it to its own balance.
+    const bridges = transactions.map((t, i) => (
+      amounts[i] !== null && before(i) !== null && balances[i] !== null && balances[i] - before(i) === amounts[i]
+    ));
+    const confirmedBefore = (i) => (i === 0 ? opening !== null : bridges[i - 1]);
+    const confirmedAfter = (i) => (
+      i + 1 < transactions.length ? bridges[i + 1] : closing !== null && balances[i] === closing
+    );
+
+    transactions.forEach((transaction, i) => {
+      if (bridges[i] || before(i) === null || balances[i] === null) return;
+      if (!String(transaction.Amount || "").trim()) return;
+      const change = balances[i] - before(i);
+      if (change === 0) return;
+      const signLost = amounts[i] === null && amountCents(transaction) === Math.abs(change);
+      if (!signLost && !(confirmedBefore(i) && confirmedAfter(i))) return;
+
+      transaction.Amount = formatCents(Math.abs(change)) + (change > 0 ? "+" : "-");
+      transaction._low_confidence_fields = sortedUnique([...(transaction._low_confidence_fields || []), "Amount"]);
+      if (transaction._review_status === "Reconcile balance gap") delete transaction._review_status;
+    });
+    return transactions;
+  }
+
+  // ------------------------------------------------------------------
+  // Web-only: Maybank soft copy (text layer)
+  // ------------------------------------------------------------------
+  //
+  // A digital Maybank statement carries its text, so it is read from word positions rather
+  // than OCR. Each row is a dated line "ENTRY DATE | TYPE | AMOUNT | BALANCE" followed by
+  // description lines, the last of which repeats the type. Rows run across page breaks.
+  // Types, statement figures and balance checks are the same Maybank rules the scan uses.
+
+  const MB_TEXT_DATE_RE = /^(\d{2})\/(\d{2})(?:\/(\d{2}))?$/;
+  const MB_TEXT_AMOUNT_RE = /^\d{1,3}(?:,\d{3})*\.\d{2}[+-]$/;
+  const MB_TEXT_BALANCE_RE = /^\d{1,3}(?:,\d{3})*\.\d{2}-?$/;
+  const MB_TEXT_COLUMN_MARGIN = 6;
+
+  function isMaybankTextStatement(lines) {
+    const text = normalizeOcrText(lines.map(String).join(" "));
+    return text.includes("ENTRY DATE") && text.includes("TRANSACTION AMOUNT") && text.includes("STATEMENT BALANCE");
+  }
+
+  // One page as printed rows of text, top to bottom. The text layer lists the page header after
+  // the table and puts "ENDING BALANCE :" and the account number on lines apart from their
+  // figures; joined by position they sit side by side again.
+  async function mbTextPageLines(doc, pageIndex) {
+    return clicksPageLines(await doc.pageWords(pageIndex))
+      .map((line) => line.words.map(([, word]) => word).join(" "));
+  }
+
+  // Returns the rows and the statement's text as printed rows (see mbTextPageLines).
+  async function parseMaybankTextStatement(doc, statementDate) {
+    const transactions = [];
+    const pageText = [];
+    let current = null;
+    for (let pageIndex = 0; pageIndex < doc.pageCount; pageIndex += 1) {
+      const lines = clicksPageLines(await doc.pageWords(pageIndex));
+      pageText.push(...(await mbTextPageLines(doc, pageIndex)));
+      const headerIndex = lines.findIndex(mbTextIsHeader);
+      if (headerIndex === -1) continue;
+      const columns = mbTextColumnsFromHeader(lines[headerIndex]);
+
+      for (const line of lines.slice(headerIndex + 1)) {
+        const text = line.words.map(([, word]) => word).join(" ");
+        // The page's "Perhatian / Note" footer starts left of the date column;
+        // ENDING BALANCE and the totals close the statement.
+        if (line.words[0][0] < columns.date || isSummary(text)) break;
+        if (normalizeOcrText(text).startsWith("BEGINNING BALANCE")) continue;
+
+        const row = mbTextRowStart(line, columns, statementDate);
+        if (row) {
+          if (current) transactions.push(mbTextTransaction(current));
+          current = row;
+        } else if (current) {
+          const continuation = mbTextWords(line, columns.date, columns.amount);
+          if (continuation) current.details.push(continuation);
+        }
+      }
+    }
+    if (current) transactions.push(mbTextTransaction(current));
+    return { transactions, lines: pageText };
+  }
+
+  function mbTextIsHeader(line) {
+    const text = normalizeOcrText(line.words.map(([, word]) => word).join(" "));
+    return text.includes("ENTRY DATE") && text.includes("STATEMENT BALANCE");
+  }
+
+  function mbTextColumnsFromHeader(line) {
+    const find = (label) => line.words.find(([, text]) => text.toUpperCase() === label);
+    // Header reads "ENTRY DATE | TRANSACTION DESCRIPTION | TRANSACTION AMOUNT | STATEMENT BALANCE".
+    const transactionXs = line.words.filter(([, text]) => text.toUpperCase() === "TRANSACTION").map(([x]) => x);
+    return {
+      date: find("ENTRY")[0] - MB_TEXT_COLUMN_MARGIN,
+      amount: transactionXs[transactionXs.length - 1] - MB_TEXT_COLUMN_MARGIN,
+      balance: find("STATEMENT")[0] - MB_TEXT_COLUMN_MARGIN,
+    };
+  }
+
+  function mbTextWords(line, left, right) {
+    return line.words
+      .filter(([x]) => left <= x && (right === null || x < right))
+      .map(([, word]) => word)
+      .join(" ");
+  }
+
+  // A dated line with a balance starts a row; anything else continues the row above.
+  function mbTextRowStart(line, columns, statementDate) {
+    const [first, ...rest] = line.words;
+    const match = MB_TEXT_DATE_RE.exec(first[1]);
+    if (!match || first[0] >= columns.amount) return null;
+    const balance = mbTextWords(line, columns.balance, null);
+    if (!balance) return null;
+    const day = Number(match[1]);
+    const month = Number(match[2]);
+    const date = match[3] !== undefined
+      ? makeDate(2000 + Number(match[3]), month, day)
+      : statementDate ? mbResolveDate([day, month], statementDate) : null;
+    return {
+      date,
+      shortDate: `${match[1]}/${match[2]}`,
+      header: mbTextWords({ words: rest }, columns.date, columns.amount),
+      amount: mbTextWords(line, columns.amount, columns.balance).split(" ").join(""),
+      balance: balance.split(" ").join(""),
+      details: [],
+    };
+  }
+
+  function mbTextTransaction(row) {
+    const type = mbTransactionType(row.header);
+    const details = row.details.slice();
+    // The last description line repeats the type ("SALE DEBIT"); the type column already says it.
+    if (type !== "UNCLASSIFIED" && details.length && normalizeOcrText(details[details.length - 1]) === normalizeOcrText(row.header)) {
+      details.pop();
+    }
+    const description = details.join(" ").trim() || mbDescriptionFromHeader(row.header, type);
+    const amount = MB_TEXT_AMOUNT_RE.test(row.amount) ? row.amount : "";
+    const balance = MB_TEXT_BALANCE_RE.test(row.balance) ? row.balance : "";
+
+    const transaction = {
+      Date: row.date ? `${pad2(row.date.d)}/${pad2(row.date.m)}` : row.shortDate,
+      "Transaction Type": type,
+      Description: description,
+      Amount: amount || row.amount,
+      Balance: balance || row.balance,
+    };
+    if (row.date) transaction._transaction_date = row.date;
+    const lowConfidence = new Set();
+    if (!row.date) lowConfidence.add("Date");
+    if (!description) lowConfidence.add("Description");
+    if (type === "UNCLASSIFIED") lowConfidence.add("Transaction Type");
+    if (!amount) lowConfidence.add("Amount");
+    if (!balance) lowConfidence.add("Balance");
+    if (lowConfidence.size) transaction._low_confidence_fields = sortedUnique(lowConfidence);
+    return transaction;
+  }
+
   // ------------------------------------------------------------------
   // src/pipeline.py
   // ------------------------------------------------------------------
@@ -3579,12 +3781,13 @@
 
   // Distinct account numbers across every page header, first match first. More than one
   // means the PDF covers several accounts. OCR pages are already cached by the time this runs.
-  async function statementAccountNumbers(doc, method) {
+  async function statementAccountNumbers(doc, method, bank) {
     const numbers = [];
     for (let pageIndex = 0; pageIndex < doc.pageCount; pageIndex += 1) {
-      const lines = method === "ocr"
-        ? (await doc.ocrPage(pageIndex)).text.split(/\r?\n/)
-        : await doc.pageTextLines(pageIndex);
+      let lines;
+      if (method === "ocr") lines = (await doc.ocrPage(pageIndex)).text.split(/\r?\n/);
+      else if (bank === MAYBANK) lines = await mbTextPageLines(doc, pageIndex);
+      else lines = await doc.pageTextLines(pageIndex);
       for (const number of accountNumbersFromLines(lines)) {
         if (!numbers.some((known) => sameAccountNumber(known, number, method === "ocr"))) numbers.push(number);
       }
@@ -3597,7 +3800,7 @@
     // The rows are already read. A header that trips up the account lookup leaves the
     // account unknown; it never costs the person their extraction.
     let accountNumbers = [];
-    try { accountNumbers = await statementAccountNumbers(doc, outcome.method); } catch (error) { accountNumbers = []; }
+    try { accountNumbers = await statementAccountNumbers(doc, outcome.method, outcome.bank); } catch (error) { accountNumbers = []; }
     return { ...outcome, accountNumber: accountNumbers[0] || null, accountNumbers };
   }
 
@@ -3643,6 +3846,12 @@
       if (history.length) return { bank, method: "text", transactions: history };
     }
 
+    if (bank === MAYBANK && isMaybankTextStatement(selectable)) {
+      step("Reading Maybank statement");
+      const { transactions, lines } = await parseMaybankTextStatement(doc, statementDate);
+      if (transactions.length) return maybankOutcome("text", transactions, lines);
+    }
+
     step("Scanning pages with OCR");
     const scanned = await parseMaybankScannedStatement(doc);
     if (scanned.length) return { bank: MAYBANK, method: "ocr", transactions: recoverOutOfOrderDates(scanned) };
@@ -3669,6 +3878,17 @@
       bank,
       method: "ocr",
       transactions: recoverOutOfOrderDates(applyStatementYear(correctAmountFromPrintedTotals(parseTransactions(cleanLines(ocrLines)), ocrSummary), statementDate)),
+    };
+  }
+
+  // Web-only: a Maybank soft copy is compared against the totals and balances it prints, and
+  // amounts its own running balance proves are corrected (see mbRepairAmountsFromBalances).
+  // lines: the statement's text lines, one per printed row.
+  function maybankOutcome(method, transactions, lines) {
+    const { summary, opening, closing } = mbStatementFigures(lines);
+    return {
+      bank: MAYBANK, method, summary, opening, closing,
+      transactions: mbRepairAmountsFromBalances(transactions, opening, closing),
     };
   }
 
